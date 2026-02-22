@@ -1,0 +1,209 @@
+# telegram_app.py
+# -*- coding: utf-8 -*-
+import asyncio
+import json
+import os
+import time
+from typing import Any, Dict, List, Optional, Union, Tuple
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
+
+CONFIG_PATH = os.getenv("TG_CONFIG_PATH", "tg_config.json")
+APP_HOST = os.getenv("TG_APP_HOST", "127.0.0.1")
+APP_PORT = int(os.getenv("TG_APP_PORT", "5001"))
+
+# ----------------- config -----------------
+def load_config() -> Dict[str, Any]:
+    if not os.path.isfile(CONFIG_PATH):
+        raise RuntimeError(f"Config not found: {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    for k in ("api_id", "api_hash", "session_name"):
+        if k not in cfg or not cfg[k]:
+            raise RuntimeError(f"Missing config key: {k}")
+    cfg.setdefault("send_delay_sec", 0.6)
+    cfg.setdefault("default_targets", [])
+    return cfg
+
+CFG = load_config()
+
+# ----------------- telegram client -----------------
+client = TelegramClient(CFG["session_name"], int(CFG["api_id"]), str(CFG["api_hash"]))
+
+async def ensure_login() -> None:
+    """
+    Первый запуск спросит номер телефона и код (в консоли).
+    После этого создаст .session файл и дальше будет логиниться автоматически.
+    """
+    if not client.is_connected():
+        await client.connect()
+
+    if not await client.is_user_authorized():
+        # Telethon сам спросит номер и код в stdin
+        print("\n[TELEGRAM] Not authorized. Starting interactive sign-in...")
+        await client.start()
+        print("[TELEGRAM] Authorized OK.")
+    else:
+        # гарантируем что сессия валидная
+        pass
+
+# ----------------- models -----------------
+Target = Union[str, int]
+
+class SendPayload(BaseModel):
+    # "sql_table" style
+    table_name: Optional[str] = None
+    columns: Optional[List[str]] = None
+    rows: Optional[List[Dict[str, Any]]] = None
+
+    # or generic payload
+    text: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+    # where to send
+    targets: Optional[List[Target]] = None
+
+    # optional: mention if you want manual title
+    title: Optional[str] = None
+
+
+# ----------------- formatting -----------------
+def format_as_message(payload: SendPayload) -> str:
+    if payload.text:
+        return payload.text.strip()
+
+    if payload.rows is not None:
+        title = payload.title or payload.table_name or "SQL table"
+        cols = payload.columns
+        if not cols and payload.rows:
+            # берем ключи из первой строки
+            cols = list(payload.rows[0].keys())
+
+        lines = [f"📌 {title}"]
+        if cols:
+            lines.append(" | ".join(map(str, cols)))
+            lines.append("-" * min(60, max(10, len(lines[-1]))))
+
+        # ограничим длину, чтобы не улететь в лимиты
+        max_rows = 30
+        for i, r in enumerate(payload.rows[:max_rows], start=1):
+            if cols:
+                lines.append(" | ".join(str(r.get(c, "")) for c in cols))
+            else:
+                lines.append(str(r))
+        if len(payload.rows) > max_rows:
+            lines.append(f"... и ещё {len(payload.rows) - max_rows} строк(и)")
+
+        return "\n".join(lines).strip()
+
+    if payload.data is not None:
+        title = payload.title or "Данные"
+        # pretty json
+        body = json.dumps(payload.data, ensure_ascii=False, indent=2)
+        # Telegram любит умеренные размеры
+        if len(body) > 3500:
+            body = body[:3500] + "\n... (truncated)"
+        return f"📌 {title}\n{body}"
+
+    # fallback: пустой payload
+    return "⚠️ Получен пустой payload (нет text/data/rows)."
+
+
+# ----------------- sending core -----------------
+async def resolve_entity(t: Target):
+    """
+    Telethon принимает: @username, ссылки t.me, numeric id, entity.
+    Здесь делаем единый resolve, чтобы заранее упасть, если чат неверный.
+    """
+    return await client.get_entity(t)
+
+async def send_to_targets(text: str, targets: List[Target], delay_sec: float) -> Dict[str, Any]:
+    report = {
+        "ok": [],
+        "failed": [],
+        "total": len(targets),
+        "started_at": int(time.time()),
+        "finished_at": None,
+    }
+
+    for idx, t in enumerate(targets, start=1):
+        try:
+            entity = await resolve_entity(t)
+            await client.send_message(entity, text)
+            report["ok"].append({"target": t, "index": idx})
+            # маленькая пауза, чтобы не триггерить флуд
+            await asyncio.sleep(delay_sec)
+        except FloodWaitError as e:
+            # Telegram попросил подождать
+            wait_s = int(getattr(e, "seconds", 0) or 0)
+            report["failed"].append({"target": t, "index": idx, "error": f"FLOOD_WAIT_{wait_s}s"})
+            # Можно либо ждать, либо сразу отчитываться. Я делаю "ждать и продолжать"
+            if wait_s > 0 and wait_s < 60:
+                await asyncio.sleep(wait_s + 1)
+                # после ожидания попробуем ещё раз один раз
+                try:
+                    entity = await resolve_entity(t)
+                    await client.send_message(entity, text)
+                    report["ok"].append({"target": t, "index": idx, "retry": True})
+                except Exception as e2:
+                    report["failed"].append({"target": t, "index": idx, "error": f"RETRY_FAIL: {type(e2).__name__}: {e2}"})
+        except RPCError as e:
+            report["failed"].append({"target": t, "index": idx, "error": f"RPCError: {type(e).__name__}: {e}"})
+        except Exception as e:
+            report["failed"].append({"target": t, "index": idx, "error": f"{type(e).__name__}: {e}"})
+
+    report["finished_at"] = int(time.time())
+    return report
+
+
+# ----------------- fastapi -----------------
+app = FastAPI(title="telegram_app", version="1.0")
+
+@app.on_event("startup")
+async def on_startup():
+    await ensure_login()
+    print(f"[telegram_app] ready on http://{APP_HOST}:{APP_PORT}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "authorized": await client.is_user_authorized()}
+
+# ВАЖНО: forwarder у тебя постит прямо в TELEGRAM_APP_URL без path :contentReference[oaicite:2]{index=2}
+# Поэтому делаем POST "/" как "принимаю что угодно".
+@app.post("/")
+async def receive_any(order: Dict[str, Any]):
+    # Превратим это в сообщение и отправим по default_targets
+    targets = CFG.get("default_targets", [])
+    if not targets:
+        raise HTTPException(status_code=400, detail="No default_targets in tg_config.json")
+
+    payload = SendPayload(data=order, title="Новая заявка")
+    text = format_as_message(payload)
+    report = await send_to_targets(text, targets, float(CFG.get("send_delay_sec", 0.6)))
+    return {"status": "ok", "sent": report}
+
+# Более управляемый endpoint: можно передать targets вместе с данными
+@app.post("/send")
+async def send(payload: SendPayload):
+    targets = payload.targets or CFG.get("default_targets", [])
+    if not targets:
+        raise HTTPException(status_code=400, detail="targets required (or set default_targets in config)")
+
+    text = format_as_message(payload)
+    report = await send_to_targets(text, targets, float(CFG.get("send_delay_sec", 0.6)))
+    return {"status": "ok", "sent": report}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
